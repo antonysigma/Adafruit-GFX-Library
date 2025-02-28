@@ -32,7 +32,8 @@ POSSIBILITY OF SUCH DAMAGE.
  */
 
 #include "Adafruit_GFX.h"
-#include "glcdfont.c"
+
+#include "glcdfont.cpp"
 #ifdef __AVR__
 #include <avr/pgmspace.h>
 #elif defined(ESP8266) || defined(ESP32)
@@ -1117,6 +1118,154 @@ void Adafruit_GFX::drawChar(int16_t x, int16_t y, unsigned char c,
   drawChar(x, y, c, color, bg, size, size);
 }
 
+namespace {
+
+/** A 8-by-5 binary image representing fixed-with font. */
+struct pixmap_t {
+    uint8_t buffer[5]{};
+
+    constexpr pixmap_t() {}
+    constexpr pixmap_t(const uint8_t *ptr) {
+        // TODO Use std::copy_n.
+        for (size_t i = 0; i < 5; i++) {
+            buffer[i] = ptr[i];
+        }
+    }
+};
+
+static_assert(sizeof(pixmap_t) == 5);
+
+/** Lightweight implementation of std::array for C++14. */
+template <typename T, size_t Size>
+struct Array {
+    T buffer[Size]{};
+
+    [[nodiscard]] constexpr const T *begin() const { return buffer; }
+
+    [[nodiscard]] constexpr const T *end() const { return buffer + Size; }
+
+    [[nodiscard]] constexpr T &operator[](size_t i) { return buffer[i]; }
+
+    [[nodiscard]] constexpr const T &operator[](size_t i) const { return buffer[i]; }
+};
+
+constexpr char used_characters[]{R"(Peltier contoller
+T=  xx.xC xx.xC
+TEC= xxx%  xxx%
+)"
+                                 "012345689"
+                                 "ALARM"
+                                 "LOCK"};
+
+template <size_t Size>
+constexpr size_t
+uniqueCount(const char (&arr)[Size]) {
+    Array<char, Size> dictionary;
+    const auto is_found = [&](const char c) -> bool {
+        for (const auto item : dictionary) {
+            if (c == item) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    size_t count = 0;
+    for (const auto item : arr) {
+        if (item == '\0') {
+            break;
+        }
+
+        if (is_found(item)) {
+            continue;
+        }
+
+        dictionary[count++] = item;
+    }
+
+    return count;
+}
+static_assert(uniqueCount(used_characters) > 0);
+static_assert(uniqueCount(used_characters) < sizeof(used_characters));
+
+/** A flat map.
+ * TODO: Use constexpr std::array
+ * TODO: Use template class to define a generic FlatMap.
+ */
+template <size_t Size>
+class FilteredFontMap {
+    static constexpr Array<char, Size> keys{[]() {
+        Array<char, Size> keys;
+
+        const auto is_found = [&](const char c) -> bool {
+            if (c == '\0') {
+                return false;
+            }
+
+            for (const auto key : keys) {
+                if (c == key) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        size_t key_idx = 0;
+        for (const char c : used_characters) {
+            const bool is_null = c == '\0';
+            if (is_null) {
+                break;
+            }
+
+            if (is_found(c)) {
+                continue;
+            }
+
+            keys[key_idx++] = c;
+        }
+
+        // TODO: Sort the keys such that the compiler can synthesize
+        // binary-search algorithm.
+        return keys;
+    }()};
+
+    static constexpr Array<pixmap_t, Size> PROGMEM font_data{[]() {
+        Array<pixmap_t, Size> data;
+
+        for (const char &c : keys) {
+            const size_t idx = (&c) - keys.begin();
+            data[idx] = pixmap_t{font + static_cast<uint16_t>(c) * sizeof(pixmap_t)};
+        }
+        return data;
+    }()};
+
+   public:
+    /** Compile-time nested switch statement. Compile should either turn it into
+     * a jump table, a binary search, or an if-else chain based on the range and
+     * sparsity of characters. */
+    template <size_t idx = 0>
+    [[nodiscard]] static const uint8_t *find(const char c) {
+        static_assert(sizeof(font_data) < 200, "Font map > 200 Bytes!");
+        if constexpr (idx >= Size) {
+            // Return null character
+            return reinterpret_cast<const uint8_t *>(font_data.end() - 1);
+        } else {
+            // TODO: Use constexpr std::find_if
+            switch (constexpr auto key = keys[idx]; c) {
+                case key:
+                    return reinterpret_cast<const uint8_t *>(font_data.begin() + idx);
+                default:
+                    // Compile-time recursion.
+                    return find<idx + 1>(c);
+            }
+        }
+    }
+};
+
+using FontMap = FilteredFontMap<uniqueCount(used_characters)>;
+
+}  // namespace
+
 // Draw a character
 /**************************************************************************/
 /*!
@@ -1147,22 +1296,26 @@ void Adafruit_GFX::drawChar(int16_t x, int16_t y, unsigned char c,
       c++; // Handle 'classic' charset behavior
 
     startWrite();
+
+    const auto pixmap = FontMap::find(c);
     for (int8_t i = 0; i < 5; i++) { // Char bitmap = 5 columns
-      uint8_t line = pgm_read_byte(&font[c * 5 + i]);
-      for (int8_t j = 0; j < 8; j++, line >>= 1) {
-        if (line & 1) {
-          if (size_x == 1 && size_y == 1)
-            writePixel(x + i, y + j, color);
-          else
-            writeFillRect(x + i * size_x, y + j * size_y, size_x, size_y,
-                          color);
-        } else if (bg != color) {
-          if (size_x == 1 && size_y == 1)
-            writePixel(x + i, y + j, bg);
-          else
-            writeFillRect(x + i * size_x, y + j * size_y, size_x, size_y, bg);
+
+        // uint8_t line = pgm_read_byte(&font[c * 5 + i]);
+        auto line = pgm_read_byte(pixmap + i);
+
+        for (int8_t j = 0; j < 8; j++, line >>= 1) {
+            if (line & 1) {
+                if (size_x == 1 && size_y == 1)
+                    writePixel(x + i, y + j, color);
+                else
+                    writeFillRect(x + i * size_x, y + j * size_y, size_x, size_y, color);
+            } else if (bg != color) {
+                if (size_x == 1 && size_y == 1)
+                    writePixel(x + i, y + j, bg);
+                else
+                    writeFillRect(x + i * size_x, y + j * size_y, size_x, size_y, bg);
+            }
         }
-      }
     }
     if (bg != color) { // If opaque, draw vertical line for last column
       if (size_x == 1 && size_y == 1)
